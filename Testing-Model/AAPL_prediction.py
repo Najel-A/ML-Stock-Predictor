@@ -3,17 +3,13 @@ import numpy as np
 import glob
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 
-# LSTM
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
-
-# XGBoost
-import xgboost as xgb
+from tensorflow.keras.optimizers import Adam
 
 # --- 1. Load and Merge CSVs ---
 path = '../data/'  # Adjust if needed
@@ -34,93 +30,86 @@ for file in all_files:
     else:
         merged_df = pd.merge(merged_df, df_temp, on='date', how='inner')
 
-merged_df = merged_df.sort_values('date').set_index('date')
-merged_df = merged_df.dropna()
+merged_df = merged_df.sort_values('date').set_index('date').dropna()
 
 # --- 2. Define Target (next-period AAPL_close) ---
 merged_df['target'] = merged_df['AAPL_close'].shift(-1)
 merged_df = merged_df.dropna()
 
-# --- 3. LSTM Section: Use All *_close Except AAPL_close ---
+# --- 3. Feature Selection (exclude AAPL_close itself) ---
 selected_features = [col for col in merged_df.columns if col.endswith('_close') and not col.startswith('AAPL')]
-X_lstm_raw = merged_df[selected_features]
-y_lstm_raw = merged_df['target']
+X_raw = merged_df[selected_features]
+y_raw = merged_df['target']
 
-# Scale inputs
+# --- 4. Scaling ---
 feature_scaler = MinMaxScaler()
-X_scaled_lstm = feature_scaler.fit_transform(X_lstm_raw)
+X_scaled = feature_scaler.fit_transform(X_raw)
 
-# Scale target
 target_scaler = MinMaxScaler()
-y_scaled_lstm = target_scaler.fit_transform(y_lstm_raw.values.reshape(-1, 1)).flatten()
+y_scaled = target_scaler.fit_transform(y_raw.values.reshape(-1, 1)).flatten()
 
-# Create sequences
-def create_lstm_sequences(data, target, window):
+# --- 5. Sequence Creation ---
+def create_sequences(X, y, window):
     X_seq, y_seq = [], []
-    for i in range(window, len(data)):
-        X_seq.append(data[i-window:i])
-        y_seq.append(target[i])
+    for i in range(window, len(X)):
+        X_seq.append(X[i-window:i])
+        y_seq.append(y[i])
     return np.array(X_seq), np.array(y_seq)
 
-window_size = 24
-X_lstm_seq, y_lstm_seq = create_lstm_sequences(X_scaled_lstm, y_scaled_lstm, window_size)
+window_size = 60
+X_seq, y_seq = create_sequences(X_scaled, y_scaled, window_size)
 
-# Train/test split
-split = int(len(X_lstm_seq) * 0.8)
-X_train_lstm, X_test_lstm = X_lstm_seq[:split], X_lstm_seq[split:]
-y_train_lstm, y_test_lstm = y_lstm_seq[:split], y_lstm_seq[split:]
+# --- 6. Train/Test Split ---
+split = int(len(X_seq) * 0.8)
+X_train, X_test = X_seq[:split], X_seq[split:]
+y_train, y_test = y_seq[:split], y_seq[split:]
 
-# Train LSTM with EarlyStopping
-model_lstm = Sequential([
-    LSTM(50, return_sequences=True, input_shape=(X_train_lstm.shape[1], X_train_lstm.shape[2])),
-    LSTM(50),
+# --- 7. LSTM Model ---
+model = Sequential([
+    LSTM(64, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+    Dropout(0.3),
+    LSTM(32),
+    Dropout(0.3),
     Dense(1)
 ])
-model_lstm.compile(optimizer='adam', loss='mse')
+model.compile(optimizer=Adam(learning_rate=0.0003), loss='mse')
 
-early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+early_stop = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
 
-model_lstm.fit(
-    X_train_lstm, y_train_lstm,
-    epochs=50,
+model.fit(
+    X_train, y_train,
+    epochs=100,
     batch_size=32,
     validation_split=0.1,
-    callbacks=[early_stop]
+    callbacks=[early_stop],
+    verbose=1
 )
 
-# Predict and inverse scale
-y_pred_lstm_scaled = model_lstm.predict(X_test_lstm).flatten()
-y_pred_lstm = target_scaler.inverse_transform(y_pred_lstm_scaled.reshape(-1, 1)).flatten()
-y_actual_lstm = target_scaler.inverse_transform(y_test_lstm.reshape(-1, 1)).flatten()
+# --- 8. Predictions ---
+y_pred_test_scaled = model.predict(X_test).flatten()
+y_pred_test = target_scaler.inverse_transform(y_pred_test_scaled.reshape(-1, 1)).flatten()
+y_actual_test = target_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
 
-# --- 4. XGBoost Section ---
-# Remove AAPL_close from features
-features = [col for col in merged_df.columns if col not in ['AAPL_close', 'target']]
-X = merged_df[features]
-y = merged_df['target']
+# Train set predictions for underfitting check
+y_pred_train_scaled = model.predict(X_train).flatten()
+y_pred_train = target_scaler.inverse_transform(y_pred_train_scaled.reshape(-1, 1)).flatten()
+y_actual_train = target_scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
 
-X_train_xgb, X_test_xgb, y_train_xgb, y_test_xgb = train_test_split(X, y, test_size=0.2, shuffle=False)
-
-model_xgb = xgb.XGBRegressor(n_estimators=100)
-model_xgb.fit(X_train_xgb, y_train_xgb)
-
-y_pred_xgb = model_xgb.predict(X_test_xgb)
-
-# --- 5. Plot Results ---
-plt.figure(figsize=(14,6))
-plt.plot(y_actual_lstm, label='Actual (LSTM)')
-plt.plot(y_pred_lstm, label='Predicted (LSTM)')
-plt.title("LSTM Prediction of AAPL Close Using Other Tech Stocks")
+# --- 9. Visualization ---
+plt.figure(figsize=(14, 6))
+plt.plot(y_actual_test, label='Actual (Test)')
+plt.plot(y_pred_test, label='Predicted (Test)')
+plt.title("LSTM Prediction on AAPL (Test Set)")
 plt.legend()
 plt.show()
 
-plt.figure(figsize=(14,6))
-plt.plot(y_test_xgb.values, label='Actual (XGBoost)')
-plt.plot(y_pred_xgb, label='Predicted (XGBoost)')
-plt.title("XGBoost Prediction of AAPL Close Using Other Tech Stocks")
+plt.figure(figsize=(14, 6))
+plt.plot(y_actual_train, label='Actual (Train)')
+plt.plot(y_pred_train, label='Predicted (Train)')
+plt.title("LSTM Prediction on AAPL (Train Set)")
 plt.legend()
 plt.show()
 
-# --- 6. RMSE Comparison ---
-print("LSTM RMSE:", np.sqrt(mean_squared_error(y_actual_lstm, y_pred_lstm)))
-print("XGBoost RMSE:", np.sqrt(mean_squared_error(y_test_xgb, y_pred_xgb)))
+# --- 10. RMSE Evaluation ---
+print("Test RMSE:", np.sqrt(mean_squared_error(y_actual_test, y_pred_test)))
+print("Train RMSE:", np.sqrt(mean_squared_error(y_actual_train, y_pred_train)))
