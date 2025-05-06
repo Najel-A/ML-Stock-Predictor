@@ -4,3 +4,4 @@ matplotlib==3.7.1
 scikit-learn==1.2.2
 xgboost==1.7.5
 tensorflow==2.13.0
+ta
